@@ -27,6 +27,7 @@ set (
   rclcpp
   std_msgs
   rosbag2_cpp
+  geometry_msgs
 )
 
 # find dependencies
@@ -37,6 +38,7 @@ find_package(unitree_api REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(rosbag2_cpp REQUIRED)
+find_package(geometry_msgs REQUIRED)
 find_package(Eigen3 REQUIRED)
 
 add_executable(low_level_ctrl src/low_level_ctrl.cpp src/common/motor_crc.cpp)
@@ -86,6 +88,9 @@ target_compile_features(b2_stand_example PRIVATE cxx_std_20)
 add_executable(b2_sport_client src/b2/b2_sport_client.cpp src/common/ros2_b2_sport_client.cpp)
 target_compile_features(b2_sport_client PRIVATE cxx_std_20)
 
+add_executable(go2_follow_controller src/go2/go2_follow_controller.cpp src/common/ros2_sport_client.cpp)
+target_compile_features(go2_follow_controller PRIVATE cxx_std_20)
+
 add_executable(h2_loco_client src/h2/high_level/h2_loco_client.cpp)
 target_compile_features(h2_loco_client PRIVATE cxx_std_20)
 
@@ -120,6 +125,8 @@ ament_target_dependencies(b2w_stand_example ${DEPENDENCY_LIST})
 
 ament_target_dependencies(b2_sport_client ${DEPENDENCY_LIST})
 ament_target_dependencies(b2_stand_example ${DEPENDENCY_LIST})
+
+ament_target_dependencies(go2_follow_controller ${DEPENDENCY_LIST})
 
 ament_target_dependencies(h2_loco_client ${DEPENDENCY_LIST})
 ament_target_dependencies(h2_ankle_swing_example ${DEPENDENCY_LIST})
@@ -164,6 +171,7 @@ endif()
 
 install(TARGETS g1_audio_client_example)
 
+install(TARGETS go2_follow_controller)
 install(TARGETS h2_loco_client)
 install(TARGETS h2_ankle_swing_example)
 
