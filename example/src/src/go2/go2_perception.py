@@ -27,6 +27,7 @@ import threading
 import cv2
 import numpy as np
 import rclpy
+import torch
 from geometry_msgs.msg import Vector3
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
@@ -67,10 +68,22 @@ class Go2Perception(Node):
 
         self.declare_parameter("camera_topic", "/frontvideostream")
         self.declare_parameter("model_path", "yolov8n.pt")
-        self.declare_parameter("device", "cuda")  # override with "cpu" or "cuda:0"
-        self.declare_parameter("conf_threshold", 0.4)
+        # "auto" → CUDA if available, else CPU. Override with "cpu", "cuda",
+        # or a specific device like "cuda:0".
+        self.declare_parameter("device", "auto")
+        self.declare_parameter("conf_threshold", 0.5)
         # distance(m) ≈ k_distance / bbox_height_px — calibrate at a known distance.
         self.declare_parameter("k_distance", 736.0)
+        # Clamp published distance into a sane physical range.
+        self.declare_parameter("min_distance", 0.3)
+        self.declare_parameter("max_distance", 8.0)
+        # EMA smoothing on bearing/distance before publishing.
+        self.declare_parameter("ema_alpha", 0.3)
+        # Max frames we'll coast on the last known target when detection misses.
+        self.declare_parameter("coast_frames", 9)  # ~0.3 s at 30 fps
+        # When re-acquiring a lost lock, only accept candidates whose center is
+        # within this fraction of frame-diagonal from the last known position.
+        self.declare_parameter("reacquire_radius", 0.25)
         self.declare_parameter("show_window", False)
         # If non-empty, perception ignores DDS and pulls frames from this URL.
         # Anything OpenCV/FFmpeg can open: udp://, rtsp://, http://, file path.
@@ -80,8 +93,13 @@ class Go2Perception(Node):
 
         self.conf = float(self.get_parameter("conf_threshold").value)
         self.k_dist = float(self.get_parameter("k_distance").value)
+        self.min_dist = float(self.get_parameter("min_distance").value)
+        self.max_dist = float(self.get_parameter("max_distance").value)
+        self.ema_alpha = float(self.get_parameter("ema_alpha").value)
+        self.coast_frames_max = int(self.get_parameter("coast_frames").value)
+        self.reacquire_radius = float(self.get_parameter("reacquire_radius").value)
         self.show = bool(self.get_parameter("show_window").value)
-        self.device = str(self.get_parameter("device").value)
+        self.device = self._resolve_device(str(self.get_parameter("device").value))
         stream_url = str(self.get_parameter("stream_url").value)
 
         model_path = self.get_parameter("model_path").value
@@ -93,11 +111,43 @@ class Go2Perception(Node):
         self._diagnostic_logged = False
         self._seen_nal_types: set[int] = set()
         self._decode_warn_count = 0
+        # Tracker state: which ByteTrack ID we're currently locked onto.
+        # None until we see a first stable ID; re-acquired when the ID is lost.
+        self._locked_id: int | None = None
+        # Last-known target geometry (used for spatial re-acquire + coast).
+        self._last_cx: float | None = None
+        self._last_cy: float | None = None
+        self._last_bh: float | None = None
+        self._last_bearing: float | None = None
+        self._last_distance: float | None = None
+        # Count of consecutive frames we've coasted without a detection.
+        self._coast_frames = 0
+
+        # Display must live on the main thread: cv2.imshow / waitKey from a
+        # worker thread is a classic silent-no-op on Linux. Detection threads
+        # drop the latest annotated frame into this slot; a ROS timer (which
+        # runs on the main rclpy thread) picks it up and renders.
+        self._display_slot: "queue.Queue[np.ndarray] | None" = (
+            queue.Queue(maxsize=1) if self.show else None
+        )
+        if self.show:
+            self._display_timer = self.create_timer(1.0 / 30.0, self._display_tick)
 
         if stream_url:
             self._setup_stream(stream_url, float(self.get_parameter("stream_fps").value))
         else:
             self._setup_dds()
+
+    def _resolve_device(self, requested: str) -> str:
+        if requested != "auto":
+            return requested
+        if torch.cuda.is_available():
+            return "cuda"
+        self.get_logger().warn(
+            "CUDA not available — falling back to CPU. "
+            "Expect single-digit FPS on the YOLO path."
+        )
+        return "cpu"
 
     def _setup_stream(self, url: str, fps: float) -> None:
         # NOTE: cv2.VideoCapture is deliberately avoided here. It silently
@@ -296,44 +346,180 @@ class Go2Perception(Node):
 
     def process_frame(self, img: np.ndarray) -> None:
         h, w = img.shape[:2]
-        # predict() avoids ByteTrack (which pulls scipy and crashes on numpy 2.x).
-        # Swap to model.track(persist=True) once tracker stability is needed.
-        results = self.model.predict(
-            img, classes=[0], conf=self.conf, device=self.device, verbose=False
+        # ByteTrack (via model.track) gives persistent IDs between frames so we
+        # can lock onto one person instead of re-picking the largest bbox each
+        # frame (which would hop to whoever walks in closest).
+        results = self.model.track(
+            img,
+            classes=[0],
+            conf=self.conf,
+            device=self.device,
+            verbose=False,
+            persist=True,
+            tracker="bytetrack.yaml",
         )
         if not results:
+            self._handle_miss(img)
             return
         boxes = results[0].boxes
-        if boxes is None or len(boxes) == 0:
-            self._maybe_show(img, None)
+        if boxes is None or len(boxes) == 0 or boxes.id is None:
+            # No detections (or tracker hasn't committed IDs yet). Coast briefly.
+            self._handle_miss(img)
             return
 
-        # Pick the largest bbox (closest person). Swap for track-id persistence later.
+        ids = boxes.id.cpu().numpy().astype(int)
         xywh = boxes.xywh.cpu().numpy()  # (N, 4): cx, cy, w, h
-        idx = int(np.argmax(xywh[:, 2] * xywh[:, 3]))
-        cx, _cy, _bw, bh = xywh[idx]
 
-        bearing = float((cx - w / 2.0) / (w / 2.0))
-        distance = float(self.k_dist / max(bh, 1.0))
+        idx = self._select_target(ids, xywh, w, h)
+        if idx is None:
+            self._handle_miss(img)
+            return
 
-        msg = Vector3(x=bearing, y=distance, z=0.0)
-        self.pub.publish(msg)
+        cx, cy, _bw, bh = xywh[idx]
+        bearing_raw = float((cx - w / 2.0) / (w / 2.0))
+        distance_raw = float(self.k_dist / max(bh, 1.0))
+        distance_raw = max(self.min_dist, min(self.max_dist, distance_raw))
+
+        # EMA on the published values. Reinit from raw when we just re-acquired.
+        if self._last_bearing is None:
+            bearing, distance = bearing_raw, distance_raw
+        else:
+            a = self.ema_alpha
+            bearing = a * bearing_raw + (1.0 - a) * self._last_bearing
+            distance = a * distance_raw + (1.0 - a) * self._last_distance
+
+        self._last_bearing = bearing
+        self._last_distance = distance
+        self._last_cx = float(cx)
+        self._last_cy = float(cy)
+        self._last_bh = float(bh)
+        self._coast_frames = 0
+
+        self.pub.publish(Vector3(x=bearing, y=distance, z=0.0))
 
         self.frame_count += 1
         if self.frame_count % 30 == 0:
             self.get_logger().info(
-                f"target: bearing={bearing:+.2f}  distance={distance:.2f} m  "
-                f"({len(boxes)} ppl, bbox_h={bh:.0f}px)"
+                f"target id={self._locked_id}: bearing={bearing:+.2f}  "
+                f"distance={distance:.2f} m  ({len(boxes)} ppl, bbox_h={bh:.0f}px)"
             )
 
         self._maybe_show(img, boxes.xyxy[idx].cpu().numpy().astype(int))
 
-    def _maybe_show(self, img: np.ndarray, xyxy) -> None:
-        if not self.show:
+    def _select_target(
+        self,
+        ids: np.ndarray,
+        xywh: np.ndarray,
+        frame_w: int,
+        frame_h: int,
+    ) -> "int | None":
+        """Return index into xywh of the target we're tracking, or None.
+
+        Rules:
+          1. If our locked ID is still present, pick it.
+          2. Otherwise re-acquire: prefer candidates close to the last known
+             position (within reacquire_radius * frame diagonal) with similar
+             bbox height. Fall back to largest bbox if we have no history.
+        """
+        # Case 1: locked ID still visible.
+        if self._locked_id is not None and self._locked_id in ids:
+            return int(np.where(ids == self._locked_id)[0][0])
+
+        # Case 2: re-acquire. Prefer spatial continuity with the last seen pose.
+        if self._last_cx is not None and self._last_bh is not None:
+            diag = float(np.hypot(frame_w, frame_h))
+            radius_px = self.reacquire_radius * diag
+            dx = xywh[:, 0] - self._last_cx
+            dy = xywh[:, 1] - self._last_cy
+            dist_px = np.hypot(dx, dy)
+            # Height ratio close to 1 means same-sized person, likely same one.
+            h_ratio = np.minimum(xywh[:, 3], self._last_bh) / np.maximum(
+                xywh[:, 3], self._last_bh
+            )
+            mask = (dist_px < radius_px) & (h_ratio > 0.6)
+            if mask.any():
+                # Among plausible candidates, take the closest in pixel space.
+                cand = int(np.argmin(np.where(mask, dist_px, np.inf)))
+                self._locked_id = int(ids[cand])
+                self.get_logger().info(
+                    f"re-acquired target as track id {self._locked_id} "
+                    f"({dist_px[cand]:.0f}px from last seen)"
+                )
+                return cand
+            # Nothing plausible — keep coasting rather than jumping to a stranger.
+            return None
+
+        # Cold start: pick the largest bbox.
+        self._locked_id = int(ids[np.argmax(xywh[:, 2] * xywh[:, 3])])
+        self.get_logger().info(f"locked onto track id {self._locked_id}")
+        return int(np.where(ids == self._locked_id)[0][0])
+
+    def _handle_miss(self, img: np.ndarray) -> None:
+        """No usable detection this frame — coast on the last known target."""
+        if self._last_bearing is None or self._coast_frames >= self.coast_frames_max:
+            # Either nothing ever locked, or we've coasted too long — let the
+            # controller's own timeout trip and StopMove.
+            if self._last_bearing is not None:
+                self._last_bearing = None
+                self._last_distance = None
+                self._locked_id = None
+                self.get_logger().warn(
+                    f"target lost after {self._coast_frames} coast frames"
+                )
+            self._maybe_show(img, None)
             return
+        # Republish the last smoothed estimate so the controller keeps its
+        # downstream state machine happy during brief occlusions.
+        self.pub.publish(
+            Vector3(x=self._last_bearing, y=self._last_distance, z=0.0)
+        )
+        self._coast_frames += 1
+        self._maybe_show(img, None)
+
+    def _maybe_show(self, img: np.ndarray, xyxy) -> None:
+        """Prep an annotated frame and hand it to the main thread for display.
+
+        Runs on the detection thread. cv2.imshow / waitKey MUST NOT be called
+        here — they only work on the thread that owns the GUI event loop
+        (on Linux, that's the main rclpy thread).
+        """
+        if not self.show or self._display_slot is None:
+            return
+        # Copy so the detection thread is free to keep mutating the source buffer.
+        annotated = img.copy()
         if xyxy is not None:
             x1, y1, x2, y2 = xyxy
-            cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        if self._locked_id is not None:
+            cv2.putText(
+                annotated,
+                f"id={self._locked_id}",
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (0, 255, 0),
+                2,
+            )
+        # Drop any pending frame (we only care about the newest) then enqueue.
+        try:
+            self._display_slot.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            self._display_slot.put_nowait(annotated)
+        except queue.Full:
+            pass
+
+    def _display_tick(self) -> None:
+        """Main-thread timer: drain the display slot and render."""
+        if self._display_slot is None:
+            return
+        try:
+            img = self._display_slot.get_nowait()
+        except queue.Empty:
+            # Still need to pump the GUI event loop even if there's no new frame.
+            cv2.waitKey(1)
+            return
         cv2.imshow("go2_perception", img)
         cv2.waitKey(1)
 
@@ -357,6 +543,11 @@ def main() -> int:
                 pass
             node.ffmpeg.terminate()
         if hasattr(node, "_stream_proc"):
+            try:
+                if node._stream_proc.stdin is not None:
+                    node._stream_proc.stdin.close()
+            except Exception:
+                pass
             node._stream_proc.terminate()
         node.destroy_node()
         if rclpy.ok():
