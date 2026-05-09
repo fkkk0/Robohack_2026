@@ -175,6 +175,10 @@ install(TARGETS go2_follow_controller)
 install(TARGETS h2_loco_client)
 install(TARGETS h2_ankle_swing_example)
 
+install(PROGRAMS src/go2/go2_perception.py
+        DESTINATION lib/${PROJECT_NAME}
+        RENAME go2_perception)
+
 
 
 if(BUILD_TESTING)

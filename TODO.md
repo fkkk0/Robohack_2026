@@ -68,3 +68,86 @@ All three live on the same DDS domain — no bridging or launch-file orchestrati
 3. **Plug in the real detector** (YOLOv8 + ByteTrack), monocular distance first.
 4. **Add lidar-fusion depth** for robustness.
 5. **Safety pass:** target-loss timeout, max velocity clamps, abort on bad `sportmodestate.mode`.
+
+
+##### ------------------------
+
+# control part
+
+> **Correction to plan above:** `SportClient` already creates its own publisher on `/api/sport/request` in its constructor (`ros2_sport_client.h:71`), and `Move` / `StopMove` publish internally (`ros2_sport_client.cpp:18,55`). The earlier note about a "missing publisher bug" was wrong — the original `go2_sport_client.cpp` does send commands. The controller therefore does not need its own `req_puber_`; calling `sport_client_.Move(req_, vx, 0, vyaw)` is enough.
+
+## Built: `example/src/src/go2/go2_follow_controller.cpp`
+
+A new node — does NOT modify `go2_sport_client.cpp`. The original example stays as a reference.
+
+### Topics
+
+| Direction | Topic | Type | Notes |
+|---|---|---|---|
+| sub | `/follow/target` | `geometry_msgs/Vector3` | `x` = bearing (rad, +ve = person to the right), `y` = distance (m), `z` ignored |
+| sub | `lf/sportmodestate` | `unitree_go/SportModeState` | only used for safety (`mode == 5` lieDown / `7` damping → stop) |
+| pub | `/api/sport/request` | `unitree_api/Request` | sent indirectly via `SportClient::Move` / `StopMove` |
+
+### Control loop (10 Hz)
+
+```
+if mode in {lieDown, damping}: StopMove; return
+if no fresh /follow/target within 0.5s: StopMove; return
+
+dist_err = distance - desired_distance
+vx   = clamp(Kp_dist * dist_err, vx_min, vx_max)        if |dist_err| > deadband else 0
+vyaw = clamp(-Kp_yaw  * bearing,  -vyaw_max, vyaw_max)  if |bearing|  > deadband else 0
+
+if distance < min_safe_dist and vx > 0: vx = 0          # never push closer than min_safe_dist
+if |bearing| > 0.4 rad:                 vx = min(vx, 0.1) # turn before walking
+
+Move(vx, 0, vyaw)
+```
+
+### Constants (hardcoded for hackathon, tune in source)
+
+| Name | Value | Meaning |
+|---|---|---|
+| `kDesiredDistance` | 1.5 m | follow distance |
+| `kDistDeadband` | 0.15 m | ignore tiny distance errors |
+| `kBearingDeadband` | 0.05 rad ≈ 3° | ignore tiny bearing errors |
+| `kKpDist` | 0.8 | forward gain |
+| `kKpYaw` | 1.5 | yaw gain |
+| `kVxMax` / `kVxMin` | +0.6 / −0.3 m/s | forward clamp (asymmetric: cautious back-up) |
+| `kVyawMax` | 1.2 rad/s | yaw clamp |
+| `kMinSafeDist` | 0.6 m | hard floor — no forward motion below this |
+| `kTargetTimeout` | 0.5 s | watchdog |
+
+### Build wiring (already added)
+
+- `example/src/CMakeLists.txt`: `geometry_msgs` added to `find_package` and `DEPENDENCY_LIST`; new `add_executable` / `target_compile_features` (cxx_std_20) / `ament_target_dependencies` / `install` for `go2_follow_controller`.
+- `example/src/package.xml`: `<depend>geometry_msgs</depend>` added.
+
+### Smoke test (no perception needed yet)
+
+```bash
+source ~/unitree_ros2/setup.sh
+cd ~/hack_2026/unitree_ros2/example
+colcon build --packages-select unitree_ros2_example
+source install/setup.bash
+
+##### new smoke test
+# Terminal A — controller
+source ~/hack_2026/unitree_ros2/setup_hackathon.sh
+~/hack_2026/unitree_ros2/example/install/unitree_ros2_example/bin/go2_follow_controller
+
+# Terminal B — fake the perception output (try each line one at a time)
+source ~/hack_2026/unitree_ros2/setup_hackathon.sh
+ros2 topic pub -r 10 /follow/target geometry_msgs/Vector3 "{x: 0.0, y: 1.5}"   # idle (centered, at follow distance)
+ros2 topic pub -r 10 /follow/target geometry_msgs/Vector3 "{x: 0.3, y: 1.5}"   # turn right
+ros2 topic pub -r 10 /follow/target geometry_msgs/Vector3 "{x: 0.0, y: 3.0}"   # walk forward
+
+# Terminal C — watch what the controller is sending to the (absent) robot
+source ~/hack_2026/unitree_ros2/setup_hackathon.sh
+ros2 topic echo /api/sport/request
+
+
+-----
+geometry_msgs : x = bearing(angle in rad) y = distance (m) # or maybe 
+# x of the camera and size of bounding box
+api/sport/request : x = vx (m/s), y = vy (m/s), z=yaw rate (rad/s)
