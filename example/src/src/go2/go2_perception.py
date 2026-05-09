@@ -19,6 +19,7 @@ Run:
   ros2 run unitree_ros2_example go2_perception --ros-args \
       -p camera_topic:=/frontvideostream -p show_window:=true
 """
+import queue
 import subprocess
 import sys
 import threading
@@ -99,27 +100,87 @@ class Go2Perception(Node):
             self._setup_dds()
 
     def _setup_stream(self, url: str, fps: float) -> None:
-        self.cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
-        if not self.cap.isOpened():
-            raise RuntimeError(f"failed to open stream: {url}")
-        # Keep only the latest frame in OpenCV's internal queue — without this
-        # we can build up seconds of latency on a low-fps consumer.
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        period_s = 1.0 / max(fps, 1.0)
-        self.timer = self.create_timer(period_s, self._poll_stream)
-        self.get_logger().info(
-            f"stream mode: {url} @ {fps:.0f} Hz; publishing /follow/target"
+        # NOTE: cv2.VideoCapture is deliberately avoided here. It silently
+        # buffers many frames inside OpenCV's FFmpeg backend (CAP_PROP_BUFFERSIZE
+        # is ignored for the FFmpeg backend), which adds 0.5–2 s of latency.
+        # Instead we spawn ffmpeg as a subprocess with explicit low-latency
+        # flags and pipe raw BGR24 frames out of stdout — same pattern as the
+        # DDS path. A reader thread keeps draining the pipe; a worker thread
+        # only ever processes the latest frame (a 1-slot queue drops stale ones).
+
+        # Resolution must match what the Jetson is encoding. Edit if you change
+        # -video_size in the Jetson's ffmpeg / systemd unit.
+        self.stream_w = 640
+        self.stream_h = 480
+        self._stream_frame_size = self.stream_w * self.stream_h * 3
+
+        self._stream_proc = subprocess.Popen(
+            [
+                "ffmpeg",
+                "-loglevel", "warning",
+                "-fflags", "nobuffer+discardcorrupt",
+                "-flags", "low_delay",
+                "-probesize", "32",
+                "-analyzeduration", "0",
+                "-i", url,
+                "-vf", f"scale={self.stream_w}:{self.stream_h}",
+                "-f", "rawvideo",
+                "-pix_fmt", "bgr24",
+                "-an",
+                "pipe:1",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=None,
+            bufsize=0,
         )
 
-    def _poll_stream(self) -> None:
-        # Drain one extra frame: cap.grab() is decode-free, so we skip a stale
-        # frame and decode only the freshest one with cap.retrieve().
-        self.cap.grab()
-        ok, img = self.cap.retrieve()
-        if not ok:
-            self.get_logger().warn("stream read failed")
-            return
-        self.process_frame(img)
+        # Single-slot queue: reader puts the freshest frame; if the worker is
+        # busy when a new frame arrives, the old slot value is discarded.
+        self._frame_slot: queue.Queue = queue.Queue(maxsize=1)
+
+        self._reader_thread = threading.Thread(
+            target=self._stream_reader_loop, daemon=True
+        )
+        self._reader_thread.start()
+        self._worker_thread = threading.Thread(
+            target=self._stream_worker_loop, daemon=True
+        )
+        self._worker_thread.start()
+
+        self.get_logger().info(
+            f"stream mode (subprocess): {url}; publishing /follow/target"
+        )
+
+    def _stream_reader_loop(self) -> None:
+        """Read BGR24 frames from ffmpeg's stdout, push freshest into the slot."""
+        while True:
+            buf = b""
+            while len(buf) < self._stream_frame_size:
+                chunk = self._stream_proc.stdout.read(
+                    self._stream_frame_size - len(buf)
+                )
+                if not chunk:
+                    return  # ffmpeg exited
+                buf += chunk
+            img = np.frombuffer(buf, dtype=np.uint8).reshape(
+                self.stream_h, self.stream_w, 3
+            ).copy()
+            # Drop any frame that's still in the slot, then put the new one.
+            try:
+                self._frame_slot.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._frame_slot.put_nowait(img)
+            except queue.Full:
+                pass  # racing reader; whatever, next frame comes soon
+
+    def _stream_worker_loop(self) -> None:
+        """Pull the freshest frame and run perception on it."""
+        while True:
+            img = self._frame_slot.get()  # blocks until reader provides one
+            self.process_frame(img)
 
     def _setup_dds(self) -> None:
         topic = self.get_parameter("camera_topic").value
@@ -295,6 +356,8 @@ def main() -> int:
             except Exception:
                 pass
             node.ffmpeg.terminate()
+        if hasattr(node, "_stream_proc"):
+            node._stream_proc.terminate()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
