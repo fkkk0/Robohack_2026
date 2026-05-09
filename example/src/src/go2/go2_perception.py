@@ -69,7 +69,7 @@ class Go2Perception(Node):
         self.declare_parameter("device", "cuda")  # override with "cpu" or "cuda:0"
         self.declare_parameter("conf_threshold", 0.4)
         # distance(m) ≈ k_distance / bbox_height_px — calibrate at a known distance.
-        self.declare_parameter("k_distance", 1700.0)
+        self.declare_parameter("k_distance", 736.0)
         self.declare_parameter("show_window", False)
         # If non-empty, perception ignores DDS and pulls frames from this URL.
         # Anything OpenCV/FFmpeg can open: udp://, rtsp://, http://, file path.

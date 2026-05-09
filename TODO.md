@@ -146,6 +146,161 @@ ros2 topic pub -r 10 /follow/target geometry_msgs/Vector3 "{x: 0.0, y: 3.0}"   #
 source ~/hack_2026/unitree_ros2/setup_hackathon.sh
 ros2 topic echo /api/sport/request
 
+--
+# camera problem
+ The camera problem in plain language
+
+  How ROS2 sends messages
+
+  When the Go2 publishes a camera frame, what travels over the wire
+  is just a byte stream — say, 0x4F 0x82 0x1A 0x00 …. The bytes have
+   no labels attached to them. To make sense of those bytes, the
+  receiver needs to know the exact recipe — the schema — for how to
+  chop them up:
+
+  ▎ "First 8 bytes = a timestamp. Then 4 bytes = how long the next 
+  ▎ array is, call that N. Then N bytes = the array data. Then 4 
+  ▎ more bytes = the next array's length…"
+
+  That recipe is the .msg file. Our copy says:
+
+  uint64 time_frame       (8 bytes)
+  uint8[] video720p       (4-byte length + data)
+  uint8[] video360p       (4-byte length + data)
+  uint8[] video180p       (4-byte length + data)
+
+  The Go2 firmware has its own copy of this recipe baked in. As long
+   as both sides have the same recipe, deserialization works. If
+  they disagree by even one field, the receiver applies the wrong
+  recipe to the bytes and gets garbage.
+
+  What's actually happening on your robot
+
+  We confirmed our recipe matches Unitree's official ROS2 GitHub
+  repo — they're identical. But when we read one frame off the wire,
+   the lengths came back nonsensical:
+
+  video720p: length 360                      ← believable
+  video360p: length 1,535,818,905 (1.5 GB)   ← physically impossible
+
+  A 1.5 GB array can't exist in a single ROS message. So our
+  deserializer didn't actually find a real "length 1.5 GB array" —
+  it read random H.264 video bytes from the actual frame data and 
+  interpreted them as a length number, because it had drifted
+  off-position.
+
+  Why it drifts off-position
+
+  Imagine the recipe says "skip 8 bytes for the timestamp" but the
+  firmware actually wrote 12 bytes (because in its recipe there's a
+  4-byte frame_id field after the timestamp). The receiver skips 8,
+  reads the next 4 as "length of video720p" — but those 4 bytes are
+  actually the second half of the frame_id. Now the receiver thinks
+  the video720p array starts where frame_id's last bytes ended.
+  Everything is offset by 4 bytes from then on, and every subsequent
+   length-and-data pair is computed from H.264 garbage.
+
+  We don't know exactly what the firmware's recipe is — could be an
+  extra field, a renamed field, a different type, fields in a
+  different order. We just know it doesn't match ours.
+
+  Why this happens with Unitree specifically
+
+  Unitree maintains two separate SDKs for talking to the Go2:
+
+  - unitree_sdk2 (C++) — what their official apps use
+  - unitree_ros2 (this repo) — the ROS2 mirror
+
+  They generate from independent IDL files. When Unitree updates the
+   C++ SDK to add a field to Go2FrontVideoData, they sometimes ship
+  that change to the firmware before updating the ROS2 side. The
+  ROS2 GitHub stays one or two versions behind the firmware. That's
+  the gap you're hitting.
+
+  This isn't a bug in your setup — it's a versioning mismatch
+  between two pieces of Unitree's stack that you don't control.
+  Anyone running the latest firmware on a Go2 with the latest
+  unitree_ros2 from GitHub will hit the same wall on
+  will hit the same wall on Go2FrontVideoData.
+
+  What to do about it
+
+  Three real options:
+
+  1. Find the firmware's actual schema by reading the C++ SDK. Clone
+  unitree_sdk2, find their Go2FrontVideoData.idl or equivalent, port the
+   differences into your local Go2FrontVideoData.msg, rebuild
+  cyclonedds_ws. Most "correct" fix. Probably 30–60 min.
+  We confirmed our recipe matches Unitree's official ROS2 GitHub
+  repo — they're identical. But when we read one frame off the wire,
+   the lengths came back nonsensical:
+
+  video720p: length 360                      ← believable
+  video360p: length 1,535,818,905 (1.5 GB)   ← physically impossible
+
+  A 1.5 GB array can't exist in a single ROS message. So our
+  deserializer didn't actually find a real "length 1.5 GB array" —
+  it read random H.264 video bytes from the actual frame data and
+  interpreted them as a length number, because it had drifted
+  off-position.
+
+  Why it drifts off-position
+
+  Imagine the recipe says "skip 8 bytes for the timestamp" but the
+  firmware actually wrote 12 bytes (because in its recipe there's a
+  4-byte frame_id field after the timestamp). The receiver skips 8,
+  reads the next 4 as "length of video720p" — but those 4 bytes are
+  actually the second half of the frame_id. Now the receiver thinks
+  the video720p array starts where frame_id's last bytes ended.
+  Everything is offset by 4 bytes from then on, and every subsequent
+   length-and-data pair is computed from H.264 garbage.
+
+  We don't know exactly what the firmware's recipe is — could be an
+  extra field, a renamed field, a different type, fields in a
+  different order. We just know it doesn't match ours.
+
+  Why this happens with Unitree specifically
+
+  Unitree maintains two separate SDKs for talking to the Go2:
+
+  - unitree_sdk2 (C++) — what their official apps use
+  - unitree_ros2 (this repo) — the ROS2 mirror
+
+  They generate from independent IDL files. When Unitree updates the
+   C++ SDK to add a field to Go2FrontVideoData, they sometimes ship
+  that change to the firmware before updating the ROS2 side. The
+  ROS2 GitHub stays one or two versions behind the firmware. That's
+  the gap you're hitting.
+
+  This isn't a bug in your setup — it's a versioning mismatch
+  between two pieces of Unitree's stack that you don't control.
+  Anyone running the latest firmware on a Go2 with the latest
+  unitree_ros2 from GitHub will hit the same wall on
+  Go2FrontVideoData.
+
+  What to do about it
+
+  Three real options:
+
+  1. Find the firmware's actual schema by reading the C++ SDK. Clone
+   unitree_sdk2, find their Go2FrontVideoData.idl or equivalent,
+  port the differences into your local Go2FrontVideoData.msg,
+  rebuild cyclonedds_ws. Most "correct" fix. Probably 30–60 min.
+  2. Capture the raw bytes and reverse-engineer the layout.
+  Subscribe in raw mode, dump the first 64 bytes hex, look at where
+  the timestamp ends and the H.264 frame starts (an H.264 frame
+  always begins with the start code 00 00 00 01 or 00 00 01). Then
+  the .msg file is whatever fields fit between the timestamp and
+  that start code. Faster — maybe 15 min.
+  3. Use a different camera interface entirely. The Go2's
+  /api/videohub/* topics are a service-style API that might publish
+  images via a different path. Or there's a WebRTC endpoint the
+  Unitree app uses. These are less documented and potentially a
+  deeper rabbit hole.
+
+  If you want to pursue this, option 2 is fastest. Want me to write
+  the raw-byte subscriber?
+
 
 ----------------------------------------------------------------------
 geometry_msgs : x = bearing(angle in rad) y = distance (m) # or maybe 
@@ -155,3 +310,66 @@ calibrate k_distance
 
 ## commands
 source ~/hack_2026/unitree_ros2/setup_robot.sh
+
+-----------------------
+#debug camera for perception input
+
+-----
+# connect to the robot
+A. Log into the Go2
+
+  The Go2's onboard computer (Jetson) is reachable over the same
+  Ethernet. Common defaults — try in order until one works:
+
+  # typical Jetson IP on Go2
+  ssh unitree@192.168.123.18
+
+  # alt IP that some firmwares use
+  ssh unitree@192.168.123.161
+
+  # alt user name / IP
+  ssh pi@192.168.123.10
+
+  Default passwords are usually one of: 123, unitree, pi. If none of
+   these work, the password may have been set by Unitree at the
+  factory — check the sticker on the robot or the Unitree app.
+
+  If SSH fails with "host key verification failed" (because you've
+  used this IP before for something else), ssh -o 
+  StrictHostKeyChecking=no unitree@192.168.123.18.
+
+  B. Find the message definition
+
+  Once logged in:
+
+  find / -name "Go2FrontVideoData*" 2>/dev/null
+
+  You'll likely get hits in /opt/, /usr/, or ~/unitree_ros2/. The
+  .msg is human-readable; the .idl (if present) is the canonical IDL
+   form.
+
+  # whatever path the find returned for the .msg:
+  cat /path/to/Go2FrontVideoData.msg
+
+  # also worth checking the IDL if present:
+  cat /path/to/Go2FrontVideoData.idl
+
+  C. Bonus checks while you're in
+
+  Get the firmware version and SDK version installed on the robot:
+  cat /etc/os-release          # Jetson OS info
+  ls -la ~/unitree_ros2/       # the SDK install (if mirrored)
+  ls /opt/unitree* 2>/dev/null # alternate install paths
+  ros2 pkg prefix unitree_go 2>/dev/null
+  
+  D. Send me the output
+
+  Paste:
+  1. The result of find / -name "Go2FrontVideoData*"
+  2. The contents of the .msg (and .idl if present)
+  3. Anything from the bonus checks that returned interesting paths
+
+  Then I can diff that against our local
+  cyclonedds_ws/src/unitree/unitree_go/msg/Go2FrontVideoData.msg,
+  patch ours to match, rebuild, and the perception node should
+  actually decode.
