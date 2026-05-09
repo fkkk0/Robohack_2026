@@ -2,7 +2,11 @@
 """go2_perception — front-camera person detector for the follow controller.
 
 Subscribes:
-  Go2FrontVideoData  (unitree_go/msg/Go2FrontVideoData)  H.264 packets
+  Go2FrontVideoData  (unitree_go/msg/Go2FrontVideoData)
+  Empirically only `video720p` is populated by the Go2 firmware, and the
+  payload is H.264 NAL data with a small (~4 byte) proprietary prefix —
+  FFmpeg's H.264 parser skips past the prefix automatically by scanning
+  for the next start code (00 00 00 01).
 
 Publishes:
   /follow/target     (geometry_msgs/msg/Vector3)
@@ -13,27 +17,47 @@ Publishes:
 Run:
   ros2 run unitree_ros2_example go2_perception
   ros2 run unitree_ros2_example go2_perception --ros-args \
-      -p camera_topic:=/frontvideostream -p resolution:=360p -p show_window:=true
+      -p camera_topic:=/frontvideostream -p show_window:=true
 """
+import subprocess
 import sys
+import threading
 
-import av
 import cv2
 import numpy as np
 import rclpy
 from geometry_msgs.msg import Vector3
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from ultralytics import YOLO
 
 from unitree_go.msg import Go2FrontVideoData
 
 
-_FIELD_BY_RESOLUTION = {
-    "720p": "video720p",
-    "360p": "video360p",
-    "180p": "video180p",
-}
+_VIDEO_FIELDS = ("video720p", "video360p", "video180p")
+
+
+def _split_nals(stream: bytes) -> "list[bytes]":
+    """Split an H.264 annex-B byte stream into individual NAL units.
+
+    Each returned chunk starts with a start code (00 00 00 01 or 00 00 01)
+    and runs up to (but not including) the next start code.
+    """
+    units = []
+    i = 0
+    n = len(stream)
+    while i < n:
+        # Find the next start code after the one we're sitting on.
+        nxt4 = stream.find(b"\x00\x00\x00\x01", i + 3)
+        nxt3 = stream.find(b"\x00\x00\x01", i + 3)
+        if nxt4 < 0 and nxt3 < 0:
+            units.append(stream[i:])
+            break
+        nxt = min(x for x in (nxt4, nxt3) if x >= 0)
+        units.append(stream[i:nxt])
+        i = nxt
+    return units
 
 
 class Go2Perception(Node):
@@ -41,59 +65,173 @@ class Go2Perception(Node):
         super().__init__("go2_perception")
 
         self.declare_parameter("camera_topic", "/frontvideostream")
-        self.declare_parameter("resolution", "360p")
         self.declare_parameter("model_path", "yolov8n.pt")
         self.declare_parameter("device", "cuda")  # override with "cpu" or "cuda:0"
         self.declare_parameter("conf_threshold", 0.4)
         # distance(m) ≈ k_distance / bbox_height_px — calibrate at a known distance.
         self.declare_parameter("k_distance", 1700.0)
         self.declare_parameter("show_window", False)
+        # If non-empty, perception ignores DDS and pulls frames from this URL.
+        # Anything OpenCV/FFmpeg can open: udp://, rtsp://, http://, file path.
+        # Recommended: raw H.264 over UDP from the Jetson, e.g. "udp://0.0.0.0:5000".
+        self.declare_parameter("stream_url", "")
+        self.declare_parameter("stream_fps", 30.0)
 
-        topic = self.get_parameter("camera_topic").value
-        resolution = self.get_parameter("resolution").value
-        if resolution not in _FIELD_BY_RESOLUTION:
-            raise ValueError(
-                f"resolution must be one of {list(_FIELD_BY_RESOLUTION)}, got {resolution!r}"
-            )
-        self.video_field = _FIELD_BY_RESOLUTION[resolution]
         self.conf = float(self.get_parameter("conf_threshold").value)
         self.k_dist = float(self.get_parameter("k_distance").value)
         self.show = bool(self.get_parameter("show_window").value)
         self.device = str(self.get_parameter("device").value)
+        stream_url = str(self.get_parameter("stream_url").value)
 
         model_path = self.get_parameter("model_path").value
         self.get_logger().info(f"loading YOLO model: {model_path} on {self.device}")
         self.model = YOLO(model_path)
 
-        self.codec = av.CodecContext.create("h264", "r")
-
         self.pub = self.create_publisher(Vector3, "/follow/target", 10)
-        self.sub = self.create_subscription(
-            Go2FrontVideoData, topic, self.on_video, 10
-        )
         self.frame_count = 0
+        self._diagnostic_logged = False
+        self._seen_nal_types: set[int] = set()
+        self._decode_warn_count = 0
+
+        if stream_url:
+            self._setup_stream(stream_url, float(self.get_parameter("stream_fps").value))
+        else:
+            self._setup_dds()
+
+    def _setup_stream(self, url: str, fps: float) -> None:
+        self.cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+        if not self.cap.isOpened():
+            raise RuntimeError(f"failed to open stream: {url}")
+        # Keep only the latest frame in OpenCV's internal queue — without this
+        # we can build up seconds of latency on a low-fps consumer.
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        period_s = 1.0 / max(fps, 1.0)
+        self.timer = self.create_timer(period_s, self._poll_stream)
         self.get_logger().info(
-            f"subscribed to {topic} ({resolution}); publishing /follow/target"
+            f"stream mode: {url} @ {fps:.0f} Hz; publishing /follow/target"
+        )
+
+    def _poll_stream(self) -> None:
+        # Drain one extra frame: cap.grab() is decode-free, so we skip a stale
+        # frame and decode only the freshest one with cap.retrieve().
+        self.cap.grab()
+        ok, img = self.cap.retrieve()
+        if not ok:
+            self.get_logger().warn("stream read failed")
+            return
+        self.process_frame(img)
+
+    def _setup_dds(self) -> None:
+        topic = self.get_parameter("camera_topic").value
+        # Hardcoded for the Go2 720p front camera — adjust if the firmware
+        # ever switches resolution.
+        self.frame_w = 1280
+        self.frame_h = 720
+        self.frame_size = self.frame_w * self.frame_h * 3  # bgr24
+
+        # Spawn an ffmpeg subprocess: H.264 in on stdin, raw BGR24 out on stdout.
+        self.ffmpeg = subprocess.Popen(
+            [
+                "ffmpeg",
+                "-loglevel", "warning",
+                "-fflags", "nobuffer",
+                "-flags", "low_delay",
+                "-f", "h264",
+                "-i", "pipe:0",
+                "-f", "rawvideo",
+                "-pix_fmt", "bgr24",
+                "-an",
+                "pipe:1",
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=None,  # let ffmpeg log to the parent's stderr so we can see it
+            bufsize=0,
+        )
+        self._decoder_thread = threading.Thread(
+            target=self._decoder_loop, daemon=True
+        )
+        self._decoder_thread.start()
+
+        video_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+        )
+        self.sub = self.create_subscription(
+            Go2FrontVideoData, topic, self.on_video, video_qos
+        )
+        self.get_logger().info(
+            f"DDS mode: subscribed to {topic}; publishing /follow/target"
         )
 
     def on_video(self, msg: Go2FrontVideoData) -> None:
-        payload = bytes(getattr(msg, self.video_field))
+        if not self._diagnostic_logged:
+            self._log_field_diagnostics(msg)
+            self._diagnostic_logged = True
+
+        # Pick the first non-empty field. Empirically only video720p is
+        # populated, but we don't hardcode it in case firmware behavior changes.
+        payload = b""
+        for field_name in _VIDEO_FIELDS:
+            payload = bytes(getattr(msg, field_name))
+            if payload:
+                break
         if not payload:
             return
-        try:
-            packets = self.codec.parse(payload)
-        except Exception as e:  # PyAV raises a variety of FFmpeg-wrapped errors
-            self.get_logger().warn(f"H.264 parse failed: {e}")
-            return
 
-        for packet in packets:
-            try:
-                frames = self.codec.decode(packet)
-            except Exception as e:
-                self.get_logger().warn(f"H.264 decode failed: {e}")
-                continue
-            for frame in frames:
-                self.process_frame(frame.to_ndarray(format="bgr24"))
+        # Strip Go2's proprietary prefix bytes by jumping to the first NAL start code.
+        nal_start = payload.find(b"\x00\x00\x00\x01")
+        if nal_start < 0:
+            nal_start = payload.find(b"\x00\x00\x01")
+        if nal_start < 0:
+            return
+        nal_stream = payload[nal_start:]
+
+        # Log the NAL types we see (first occurrence of each).
+        for nal_unit in _split_nals(nal_stream):
+            if len(nal_unit) >= 5:
+                sc_len = 4 if nal_unit.startswith(b"\x00\x00\x00\x01") else 3
+                self._note_nal_type(nal_unit[sc_len] & 0x1F)
+
+        # Hand the whole NAL stream to ffmpeg; it'll emit decoded BGR24 frames
+        # on stdout when it has them, picked up by _decoder_loop in another thread.
+        try:
+            self.ffmpeg.stdin.write(nal_stream)
+        except BrokenPipeError:
+            self.get_logger().error("ffmpeg subprocess died — restart the node")
+
+    def _decoder_loop(self) -> None:
+        """Pull decoded BGR24 frames out of ffmpeg's stdout, one at a time."""
+        while True:
+            buf = b""
+            while len(buf) < self.frame_size:
+                chunk = self.ffmpeg.stdout.read(self.frame_size - len(buf))
+                if not chunk:
+                    return  # ffmpeg exited
+                buf += chunk
+            img = np.frombuffer(buf, dtype=np.uint8).reshape(
+                self.frame_h, self.frame_w, 3
+            )
+            self.process_frame(img)
+
+    def _note_nal_type(self, nal_type: int) -> None:
+        # NAL types: 1=non-IDR slice (P), 5=IDR (I), 7=SPS, 8=PPS, 6=SEI.
+        # Log the first occurrence of each so we can confirm SPS/PPS/IDR arrive.
+        if nal_type not in self._seen_nal_types:
+            self._seen_nal_types.add(nal_type)
+            name = {1: "P-slice", 5: "IDR (I-frame)", 6: "SEI",
+                    7: "SPS", 8: "PPS", 9: "AUD"}.get(nal_type, "other")
+            self.get_logger().info(f"first NAL type {nal_type} ({name})")
+
+    def _log_field_diagnostics(self, msg: Go2FrontVideoData) -> None:
+        for field_name in _VIDEO_FIELDS:
+            data = bytes(getattr(msg, field_name))
+            head = data[:16].hex(" ")
+            self.get_logger().info(
+                f"first frame {field_name}: len={len(data)} head={head}"
+            )
 
     def process_frame(self, img: np.ndarray) -> None:
         h, w = img.shape[:2]
@@ -149,6 +287,14 @@ def main() -> int:
     finally:
         if node.show:
             cv2.destroyAllWindows()
+        if hasattr(node, "cap"):
+            node.cap.release()
+        if hasattr(node, "ffmpeg"):
+            try:
+                node.ffmpeg.stdin.close()
+            except Exception:
+                pass
+            node.ffmpeg.terminate()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
