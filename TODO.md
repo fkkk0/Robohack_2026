@@ -147,7 +147,11 @@ source ~/hack_2026/unitree_ros2/setup_hackathon.sh
 ros2 topic echo /api/sport/request
 
 
------
+----------------------------------------------------------------------
 geometry_msgs : x = bearing(angle in rad) y = distance (m) # or maybe 
 # x of the camera and size of bounding box
 api/sport/request : x = vx (m/s), y = vy (m/s), z=yaw rate (rad/s)
+calibrate k_distance 
+
+## commands
+source ~/hack_2026/unitree_ros2/setup_robot.sh

@@ -43,6 +43,7 @@ class Go2Perception(Node):
         self.declare_parameter("camera_topic", "/frontvideostream")
         self.declare_parameter("resolution", "360p")
         self.declare_parameter("model_path", "yolov8n.pt")
+        self.declare_parameter("device", "cuda")  # override with "cpu" or "cuda:0"
         self.declare_parameter("conf_threshold", 0.4)
         # distance(m) ≈ k_distance / bbox_height_px — calibrate at a known distance.
         self.declare_parameter("k_distance", 1700.0)
@@ -58,9 +59,10 @@ class Go2Perception(Node):
         self.conf = float(self.get_parameter("conf_threshold").value)
         self.k_dist = float(self.get_parameter("k_distance").value)
         self.show = bool(self.get_parameter("show_window").value)
+        self.device = str(self.get_parameter("device").value)
 
         model_path = self.get_parameter("model_path").value
-        self.get_logger().info(f"loading YOLO model: {model_path}")
+        self.get_logger().info(f"loading YOLO model: {model_path} on {self.device}")
         self.model = YOLO(model_path)
 
         self.codec = av.CodecContext.create("h264", "r")
@@ -95,8 +97,10 @@ class Go2Perception(Node):
 
     def process_frame(self, img: np.ndarray) -> None:
         h, w = img.shape[:2]
-        results = self.model.track(
-            img, classes=[0], conf=self.conf, persist=True, verbose=False
+        # predict() avoids ByteTrack (which pulls scipy and crashes on numpy 2.x).
+        # Swap to model.track(persist=True) once tracker stability is needed.
+        results = self.model.predict(
+            img, classes=[0], conf=self.conf, device=self.device, verbose=False
         )
         if not results:
             return
