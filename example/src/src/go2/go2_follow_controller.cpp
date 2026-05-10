@@ -134,8 +134,8 @@ class Go2FollowController : public rclcpp::Node {
   static constexpr float kDistDeadband = 0.15f;
   static constexpr float kBearingDeadband = 0.05f;
   static constexpr float kKpDist = 0.8f;
-  static constexpr float kKpYaw = 2.0f;
-  static constexpr float kVxMax = 0.6f;
+  static constexpr float kKpYaw = 2.5f;
+  static constexpr float kVxMax = 0.8f;
   static constexpr float kVxMin = -0.3f;
   static constexpr float kVyawMax = 1.2f;
   static constexpr float kMinSafeDist = 0.6f;
