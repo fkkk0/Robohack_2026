@@ -188,4 +188,13 @@ cd ~/hack_2026/unitree_ros2/example
 colcon build --packages-select unitree_ros2_example
 cd build/unitree_ros2_example && cmake --install . && cd -
 
-# delete the auto activation of the camera ffmpeg
+# run perception
+
+  source ~/hack_2026/unitree_ros2/setup_robot.sh
+  ros2 run unitree_ros2_example go2_perception --ros-args \
+      -p stream_url:='udp://0.0.0.0:5000?fifo_size=1000000&overrun_nonfatal=1' \
+      -p show_window:=true
+
+# run controller 
+  source ~/hack_2026/unitree_ros2/setup_robot.sh
+ $GO2BIN/go2_follow_controller
