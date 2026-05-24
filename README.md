@@ -1,7 +1,7 @@
 Unitree robot ROS2 support
 ***************************************
 Hackathon 2026: Unitree Go2 Autonomous Human Recognition & Following
-This repository is a fork of the original Hackathon project Unitree robot ROS2 support
+This repository is a fork of the original Hackathon project [kenzy357/hack_2026](https://github.com/kenzy357/hack_2026).
 Our team successfully developed and deployed an **autonomous human recognition and target-following system** on the **Unitree Go2 quadruped robot** during the hackathon.
 ## 👥 My Contributions & Role
 In this project, I focused on the core infrastructure and robotics pipeline:
