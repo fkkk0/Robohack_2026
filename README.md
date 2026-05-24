@@ -1,5 +1,20 @@
 Unitree robot ROS2 support
+***************************************
+Hackathon 2026: Unitree Go2 Autonomous Human Recognition & Following
+This repository is a fork of the original Hackathon project Unitree robot ROS2 support
+Our team successfully developed and deployed an **autonomous human recognition and target-following system** on the **Unitree Go2 quadruped robot** during the hackathon.
+## 👥 My Contributions & Role
+In this project, I focused on the core infrastructure and robotics pipeline:
+* **Environment Setup & Middleware Configuration**: Built the containerized development workflow using Docker/Podman to cross-compile and deploy ROS 2 Humble packages smoothly on the robot's onboard computer. Configured **CycloneDDS** to ensure low-latency communication.
+* **Robot Interfacing & SDK Integration**: Integrated the Unitree Go2 SDK/`unitree_ros2` packages, handling the subscription of sensor telemetry and publishing motion commands (sport client geometry messages) to control the quadruped's gait.
+* **Target Tracking Integration**: Assisted in bridging the perception module (human detection) with the motion control loop, adjusting the relative velocity and orientation to achieve smooth and reliable autonomous following.
 
+## 🛠️ Environment & Stack
+* **Robot Hardware**: Unitree Go2 Quadruped Robot
+* **OS / Environment**: Ubuntu 22.04 / Docker Containerization
+* **Middleware & Framework**: ROS 2 Humble / CycloneDDS
+* **Core SDK**: Unitree SDK 2 / `unitree_ros2`
+*****************************************************************************
 [TOC]
 
 # Introduction
